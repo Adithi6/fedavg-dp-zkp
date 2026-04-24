@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from model.cnn import SmallCNN
+from crypto import zkp_utils
 from utils.weights import apply_weight_arrays, weights_to_bytes
 
 
@@ -59,9 +60,10 @@ class FederatedClient:
         self.learning_rate = learning_rate
         self.model_name = model_name
 
-        # Differential Privacy parameters
         self.dp_clip_norm = 1.0
         self.dp_noise_std = 0.01
+
+        self.zkp_public_key, self.zkp_secret_key, zkp_keygen_ms = zkp_utils.keygen()
 
         self.model = build_model(
             model_name=self.model_name,
@@ -89,6 +91,11 @@ class FederatedClient:
             f"clip_norm={self.dp_clip_norm} noise_std={self.dp_noise_std}"
         )
 
+        logging.info(
+            f"[{client_id}] Schnorr ZKP keygen | "
+            f"{zkp_keygen_ms:.3f} ms public_key={self.zkp_public_key}"
+        )
+
     def local_train(self, global_weight_arrays=None, epochs=1):
         if global_weight_arrays is not None:
             apply_weight_arrays(self.model, global_weight_arrays)
@@ -110,13 +117,11 @@ class FederatedClient:
 
                 loss.backward()
 
-                # Differential Privacy: gradient clipping
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     max_norm=self.dp_clip_norm,
                 )
 
-                # Differential Privacy: Gaussian noise addition
                 for param in self.model.parameters():
                     if param.grad is not None:
                         noise = torch.normal(
@@ -128,7 +133,6 @@ class FederatedClient:
                         param.grad += noise
 
                 self.optimizer.step()
-
                 total_loss += loss.item()
 
                 if batch_idx == 0:
@@ -144,19 +148,23 @@ class FederatedClient:
         )
 
     def prepare_update(self) -> dict:
-        """
-        Prepare plain model update.
-        No Dilithium.
-        No ZKP.
-        DP is applied during local training.
-        """
         update_bytes = weights_to_bytes(self.model, self.weight_dtype)
 
+        zkp = zkp_utils.generate_proof(
+            secret_key=self.zkp_secret_key,
+            update_bytes=update_bytes,
+            client_id=self.client_id,
+        )
+
         logging.info(
-            f"[{self.client_id}] update prepared | size={len(update_bytes)/1024:.1f} KB"
+            f"[{self.client_id}] Schnorr ZKP proof generated | "
+            f"size={len(update_bytes)/1024:.1f} KB "
+            f"proof={zkp['proof_ms']:.3f} ms"
         )
 
         return {
             "client_id": self.client_id,
             "update_bytes": update_bytes,
+            "zkp": zkp,
+            "zkp_public_key": self.zkp_public_key,
         }

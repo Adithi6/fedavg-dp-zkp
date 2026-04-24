@@ -8,12 +8,12 @@ from utils.weights import bytes_to_weight_arrays, apply_weight_arrays
 
 class GossipNode:
     """
-    A GossipNode = FederatedClient + gossip inbox.
-    Baseline version:
-    - No Dilithium
-    - No ZKP
-    - Keeps gossip communication
-    - Keeps decentralized aggregation
+    Gossip node for Model 3:
+    - FedAvg
+    - Differential Privacy
+    - Gossip communication
+    - Schnorr ZKP verification is handled in gossip/protocol.py
+    - Update validation is handled before aggregation
     """
 
     def __init__(
@@ -49,7 +49,6 @@ class GossipNode:
         )
 
         self.client_id = client_id
-
         self.own_submission: dict | None = None
         self.inbox: dict[str, dict] = {}
 
@@ -64,12 +63,12 @@ class GossipNode:
 
     def prepare_update(self) -> dict:
         """
-        Creates a normal model update without Dilithium signature or ZKP proof.
+        Creates a model update with Schnorr ZKP proof.
         """
         self.own_submission = self.client.prepare_update()
         self.inbox.clear()
 
-        logging.info(f"[{self.client_id}] plain update prepared and inbox reset")
+        logging.info(f"[{self.client_id}] ZKP update prepared and inbox reset")
         return self.own_submission
 
     def receive_gossip(self, message: dict):
@@ -108,23 +107,70 @@ class GossipNode:
         self.inbox.clear()
         logging.info(f"[{self.client_id}] cleared round submissions")
 
+    def is_valid_update(self, arrays: list, max_norm: float = 100.0) -> bool:
+        """
+        Lightweight abnormal-update validation.
+        Rejects:
+        - NaN values
+        - Infinite values
+        - Extremely large model updates
+
+        This does not replace full zk-SNARK training correctness proof,
+        but helps reject abnormal/malicious updates.
+        """
+        total_norm = 0.0
+
+        for arr in arrays:
+            if np.isnan(arr).any() or np.isinf(arr).any():
+                return False
+
+            total_norm += np.linalg.norm(arr)
+
+        return total_norm <= max_norm
+
     def aggregate_local_updates(self, submissions: list[dict], template_model):
         if not submissions:
             logging.warning(f"[{self.client_id}] no submissions available for aggregation")
             return
 
-        logging.info(f"[{self.client_id}] aggregating {len(submissions)} submission(s)")
+        logging.info(f"[{self.client_id}] received {len(submissions)} submission(s) for aggregation")
 
         dtype_name = self.client.weight_dtype
 
         weight_sets = []
+        accepted_clients = []
+        rejected_clients = []
+
         for sub in submissions:
             arrays = bytes_to_weight_arrays(
                 sub["update_bytes"],
                 template_model,
                 dtype_name=dtype_name,
             )
+
+            if not self.is_valid_update(arrays):
+                rejected_clients.append(sub["client_id"])
+                logging.warning(
+                    f"[{self.client_id}] rejected abnormal update from {sub['client_id']}"
+                )
+                continue
+
             weight_sets.append(arrays)
+            accepted_clients.append(sub["client_id"])
+
+        if not weight_sets:
+            logging.warning(f"[{self.client_id}] no valid updates after validation")
+            return
+
+        logging.info(
+            f"[{self.client_id}] valid updates accepted: "
+            f"{len(accepted_clients)}/{len(submissions)} | clients={accepted_clients}"
+        )
+
+        if rejected_clients:
+            logging.warning(
+                f"[{self.client_id}] rejected clients: {rejected_clients}"
+            )
 
         averaged = [
             np.mean([weights[i] for weights in weight_sets], axis=0)
@@ -133,4 +179,4 @@ class GossipNode:
 
         apply_weight_arrays(self.client.model, averaged)
 
-        logging.info(f"[{self.client_id}] local aggregation completed")
+        logging.info(f"[{self.client_id}] validated FedAvg aggregation completed")
