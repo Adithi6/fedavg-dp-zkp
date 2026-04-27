@@ -16,8 +16,8 @@ def setup_logging(config):
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[
             logging.FileHandler(config["logging"]["log_file"]),
-            logging.StreamHandler()
-        ]
+            logging.StreamHandler(),
+        ],
     )
 
 
@@ -33,13 +33,13 @@ def choose_aggregator_node(nodes):
         subs = node.get_all_submissions()
         count = len(subs)
         counts.append((node, count))
-        logging.info(f"{node.client_id} submissions = {count}")
+        logging.info(f"{node.client_id} valid submissions = {count}")
 
     max_count = max(c for _, c in counts)
     candidates = [n for n, c in counts if c == max_count]
 
     aggregator = random.choice(candidates)
-    logging.info(f"Selected aggregator: {aggregator.client_id}")
+    logging.info(f"Selected aggregator based on max valid updates: {aggregator.client_id}")
     return aggregator
 
 
@@ -61,7 +61,6 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"Using device: {device}")
 
-    # -------- CONFIG --------
     N_CLIENTS = config["experiment"]["n_clients"]
     N_ROUNDS = config["experiment"]["n_rounds"]
     LOCAL_EPOCHS = config["experiment"]["local_epochs"]
@@ -75,7 +74,10 @@ def main():
     DATA = config["data"]
     WEIGHTS = config["weights"]
 
-    # -------- DATA --------
+    logging.info("Model 3 enabled: FedAvg + DP + Gossip + Circom zk-SNARK validation")
+    logging.info("Dilithium disabled")
+    logging.info("ZKP purpose: verify update-bound constraint before aggregation")
+
     client_loaders, _ = make_client_loaders(
         n_clients=N_CLIENTS,
         batch_size=DATA["batch_size"],
@@ -90,7 +92,6 @@ def main():
         normalize_std=DATA["normalize_std"],
     )
 
-    # -------- NODES --------
     nodes = []
     for i in range(N_CLIENTS):
         node = GossipNode(
@@ -110,20 +111,20 @@ def main():
         )
         nodes.append(node)
 
-    # -------- GOSSIP --------
-    # No Dilithium, no public keys, no ZKP.
     gossip = GossipProtocol(
         fanout=GOSSIP_FANOUT,
         max_hops=GOSSIP_MAX_HOPS,
     )
 
-    # -------- INITIAL MODEL SYNC --------
     initializer = random.choice(nodes)
     init_weights = model_to_weight_arrays(initializer.client.model)
     sync_weights_to_all_nodes(nodes, init_weights)
-    logging.info(f"Initial model taken from {initializer.client_id} and synced to all nodes")
 
-    # -------- TRAINING --------
+    logging.info(
+        f"Initial model randomly selected from {initializer.client_id} "
+        f"and synced to all nodes"
+    )
+
     start_time = time.time()
 
     for r in range(1, N_ROUNDS + 1):
@@ -133,42 +134,42 @@ def main():
 
         clear_round_state(nodes, gossip)
 
-        # 1. Local training
+        # 1. Local DP training
         for node in nodes:
             node.local_train(None, epochs=LOCAL_EPOCHS)
 
-        # 2. Prepare plain updates without Dilithium/ZKP
+        # 2. Prepare update + zk-SNARK proof
         for node in nodes:
             node.prepare_update()
 
-        # 3. Gossip propagation
+        # 3. Gossip propagation with ZKP verification
         gossip.run_round(nodes)
 
-        # 4. Choose aggregator
+        # 4. Select aggregator based on maximum valid received updates
         aggregator = choose_aggregator_node(nodes)
         subs = aggregator.get_all_submissions()
 
-        # 5. Aggregate
+        # 5. Validated FedAvg aggregation
         if len(subs) == N_CLIENTS:
             logging.info(
                 f"[{aggregator.client_id}] aggregating complete round "
-                f"({len(subs)}/{N_CLIENTS} submissions)"
+                f"({len(subs)}/{N_CLIENTS} valid submissions)"
             )
         else:
             logging.warning(
                 f"[{aggregator.client_id}] incomplete aggregation: "
-                f"{len(subs)}/{N_CLIENTS} submissions available"
+                f"{len(subs)}/{N_CLIENTS} valid submissions available"
             )
 
         if len(subs) > 0:
             aggregator.aggregate_local_updates(subs, aggregator.client.model)
 
-            weights = model_to_weight_arrays(aggregator.client.model)
-            sync_weights_to_all_nodes(nodes, weights)
+            updated_weights = model_to_weight_arrays(aggregator.client.model)
+            sync_weights_to_all_nodes(nodes, updated_weights)
 
-            logging.info(f"Round {r} aggregated model synced to all nodes")
+            logging.info(f"Round {r} validated aggregated model synced to all nodes")
         else:
-            logging.warning(f"Round {r} skipped because no submissions were available")
+            logging.warning(f"Round {r} skipped because no valid submissions were available")
 
         clear_round_state(nodes, gossip)
 

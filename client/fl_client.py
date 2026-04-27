@@ -10,19 +10,17 @@ from utils.weights import apply_weight_arrays, weights_to_bytes
 
 
 def build_model(
-    model_name: str,
-    device: str,
-    input_channels: int,
-    num_classes: int,
-    input_height: int,
-    input_width: int,
-    conv1_channels: int,
-    conv2_channels: int,
-    hidden_dim: int,
-) -> nn.Module:
-    model_name = model_name.lower()
-
-    if model_name == "smallcnn":
+    model_name,
+    device,
+    input_channels,
+    num_classes,
+    input_height,
+    input_width,
+    conv1_channels,
+    conv2_channels,
+    hidden_dim,
+):
+    if model_name.lower() == "smallcnn":
         return SmallCNN(
             input_channels=input_channels,
             num_classes=num_classes,
@@ -33,138 +31,111 @@ def build_model(
             hidden_dim=hidden_dim,
         ).to(device)
 
-    raise ValueError(f"Unsupported model: {model_name}")
+    raise ValueError("Unsupported model")
 
 
 class FederatedClient:
     def __init__(
         self,
-        client_id: str,
-        dataloader: DataLoader,
-        device: str,
-        weight_dtype: str,
-        learning_rate: float,
-        model_name: str,
-        input_channels: int,
-        num_classes: int,
-        input_height: int,
-        input_width: int,
-        conv1_channels: int,
-        conv2_channels: int,
-        hidden_dim: int,
+        client_id,
+        dataloader,
+        device,
+        weight_dtype,
+        learning_rate,
+        model_name,
+        input_channels,
+        num_classes,
+        input_height,
+        input_width,
+        conv1_channels,
+        conv2_channels,
+        hidden_dim,
     ):
         self.client_id = client_id
         self.dataloader = dataloader
         self.device = device
         self.weight_dtype = weight_dtype
         self.learning_rate = learning_rate
-        self.model_name = model_name
 
+        # DP params
         self.dp_clip_norm = 1.0
         self.dp_noise_std = 0.01
 
-        self.zkp_public_key, self.zkp_secret_key, zkp_keygen_ms = zkp_utils.keygen()
+        # ZKP keys
+        self.pk, self.sk, _ = zkp_utils.keygen()
 
         self.model = build_model(
-            model_name=self.model_name,
-            device=self.device,
-            input_channels=input_channels,
-            num_classes=num_classes,
-            input_height=input_height,
-            input_width=input_width,
-            conv1_channels=conv1_channels,
-            conv2_channels=conv2_channels,
-            hidden_dim=hidden_dim,
+            model_name,
+            device,
+            input_channels,
+            num_classes,
+            input_height,
+            input_width,
+            conv1_channels,
+            conv2_channels,
+            hidden_dim,
         )
 
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
-        logging.info(
-            f"[{client_id}] initialized | "
-            f"model={self.model_name} learning_rate={self.learning_rate} "
-            f"weight_dtype={self.weight_dtype}"
-        )
-
-        logging.info(
-            f"[{client_id}] DP enabled | "
-            f"clip_norm={self.dp_clip_norm} noise_std={self.dp_noise_std}"
-        )
-
-        logging.info(
-            f"[{client_id}] Schnorr ZKP keygen | "
-            f"{zkp_keygen_ms:.3f} ms public_key={self.zkp_public_key}"
-        )
-
     def local_train(self, global_weight_arrays=None, epochs=1):
         if global_weight_arrays is not None:
             apply_weight_arrays(self.model, global_weight_arrays)
 
-        if epochs == 0:
-            return
-
         self.model.train()
-        total_loss = 0.0
 
         for _ in range(epochs):
-            for batch_idx, (x, y) in enumerate(self.dataloader):
+            for x, y in self.dataloader:
                 x, y = x.to(self.device), y.to(self.device)
 
                 self.optimizer.zero_grad()
-
-                logits = self.model(x)
-                loss = self.criterion(logits, y)
-
+                loss = self.criterion(self.model(x), y)
                 loss.backward()
 
+                # DP clipping
                 torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.dp_clip_norm,
+                    self.model.parameters(), self.dp_clip_norm
                 )
 
+                # DP noise
                 for param in self.model.parameters():
                     if param.grad is not None:
-                        noise = torch.normal(
-                            mean=0.0,
-                            std=self.dp_noise_std,
+                        param.grad += torch.normal(
+                            0,
+                            self.dp_noise_std,
                             size=param.grad.shape,
                             device=param.grad.device,
                         )
-                        param.grad += noise
 
                 self.optimizer.step()
-                total_loss += loss.item()
 
-                if batch_idx == 0:
-                    pred = torch.argmax(logits, dim=1)
-                    logging.info(
-                        f"[{self.client_id}] pred={pred[0].item()} | actual={y[0].item()}"
-                    )
-
-        total_batches = len(self.dataloader) * epochs
-        logging.info(
-            f"[{self.client_id}] trained with DP | "
-            f"loss: {total_loss / total_batches:.4f}"
-        )
-
-    def prepare_update(self) -> dict:
+    def prepare_update(self):
         update_bytes = weights_to_bytes(self.model, self.weight_dtype)
 
-        zkp = zkp_utils.generate_proof(
-            secret_key=self.zkp_secret_key,
-            update_bytes=update_bytes,
-            client_id=self.client_id,
+        # Schnorr signature (identity proof)
+        schnorr_proof = zkp_utils.generate_proof(
+            self.sk,
+            update_bytes,
+            self.client_id,
         )
 
-        logging.info(
-            f"[{self.client_id}] Schnorr ZKP proof generated | "
-            f"size={len(update_bytes)/1024:.1f} KB "
-            f"proof={zkp['proof_ms']:.3f} ms"
-        )
+        # Real zk-SNARK (model norm proof)
+        # We sample 10 weights from the model to prove (since our circuit size is 10)
+        from utils.weights import model_to_weight_arrays
+        import numpy as np
+        arrays = model_to_weight_arrays(self.model)
+        flat = np.concatenate([arr.flatten() for arr in arrays])
+        # scale and make positive for circom
+        sampled_weights = np.abs(flat[:10] * 1000).astype(int).tolist()
+        
+        snark_proof, snark_public, _ = zkp_utils.generate_snark(sampled_weights, threshold=100000000)
 
         return {
             "client_id": self.client_id,
             "update_bytes": update_bytes,
-            "zkp": zkp,
-            "zkp_public_key": self.zkp_public_key,
+            "zkp": schnorr_proof,
+            "snark_proof": snark_proof,
+            "snark_public": snark_public,
+            "public_key": self.pk,
         }

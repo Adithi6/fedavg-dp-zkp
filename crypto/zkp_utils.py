@@ -1,6 +1,11 @@
 import hashlib
 import secrets
 import time
+import os
+import json
+import subprocess
+import tempfile
+
 
 
 # Large prime group parameters
@@ -74,3 +79,69 @@ def verify_proof(public_key: int, update_bytes: bytes, client_id: str, proof: di
     verify_ms = (time.time() - start) * 1000
 
     return left == right, verify_ms
+
+def generate_snark(values: list[int], threshold: int):
+    start = time.time()
+    input_data = {
+        "values": values,
+        "threshold": threshold
+    }
+    
+    # We use the existing directory to run snarkjs
+    zkp_dir = r"c:\Users\ADITHI\Desktop\fedavg_dp_zkp\zkp"
+    build_dir = os.path.join(zkp_dir, "build")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.json")
+        with open(input_path, "w") as f:
+            json.dump(input_data, f)
+            
+        proof_path = os.path.join(tmpdir, "proof.json")
+        public_path = os.path.join(tmpdir, "public.json")
+        
+        cmd = [
+            "npx.cmd", "snarkjs", "groth16", "fullprove",
+            input_path,
+            os.path.join(build_dir, "update_norm_js", "update_norm.wasm"),
+            os.path.join(build_dir, "update_norm_0001.zkey"),
+            proof_path,
+            public_path
+        ]
+        
+        subprocess.run(cmd, check=True, cwd=zkp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        with open(proof_path, "r") as f:
+            proof = json.load(f)
+        with open(public_path, "r") as f:
+            public_signals = json.load(f)
+            
+    snark_ms = (time.time() - start) * 1000
+    return proof, public_signals, snark_ms
+
+def verify_snark(proof: dict, public_signals: list):
+    start = time.time()
+    
+    zkp_dir = r"c:\Users\ADITHI\Desktop\fedavg_dp_zkp\zkp"
+    build_dir = os.path.join(zkp_dir, "build")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        proof_path = os.path.join(tmpdir, "proof.json")
+        public_path = os.path.join(tmpdir, "public.json")
+        
+        with open(proof_path, "w") as f:
+            json.dump(proof, f)
+        with open(public_path, "w") as f:
+            json.dump(public_signals, f)
+            
+        cmd = [
+            "npx.cmd", "snarkjs", "groth16", "verify",
+            os.path.join(build_dir, "verification_key.json"),
+            public_path,
+            proof_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, cwd=zkp_dir)
+        is_valid = "OK" in result.stdout.decode()
+        
+    verify_ms = (time.time() - start) * 1000
+    return is_valid, verify_ms
