@@ -54,6 +54,20 @@ def clear_round_state(nodes, gossip):
     gossip.reset_round()
 
 
+def evaluate_model(model, test_loader, device):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            outputs = model(data)
+            _, predicted = torch.max(outputs.data, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
+    return correct / total
+
+
 def main():
     config = load_config()
     setup_logging(config)
@@ -78,7 +92,7 @@ def main():
     logging.info("Dilithium disabled")
     logging.info("ZKP purpose: verify update-bound constraint before aggregation")
 
-    client_loaders, _ = make_client_loaders(
+    client_loaders, test_loader = make_client_loaders(
         n_clients=N_CLIENTS,
         batch_size=DATA["batch_size"],
         alpha=DATA["alpha"],
@@ -167,6 +181,8 @@ def main():
             updated_weights = model_to_weight_arrays(aggregator.client.model)
             sync_weights_to_all_nodes(nodes, updated_weights)
 
+            accuracy = evaluate_model(aggregator.client.model, test_loader, device)
+            logging.info(f"Round {r} global test accuracy: {accuracy * 100:.2f}%")
             logging.info(f"Round {r} validated aggregated model synced to all nodes")
         else:
             logging.warning(f"Round {r} skipped because no valid submissions were available")

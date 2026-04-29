@@ -1,4 +1,6 @@
 import logging
+import time
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -80,6 +82,7 @@ class FederatedClient:
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
     def local_train(self, global_weight_arrays=None, epochs=1):
+        start_time = time.time()
         if global_weight_arrays is not None:
             apply_weight_arrays(self.model, global_weight_arrays)
 
@@ -109,10 +112,15 @@ class FederatedClient:
                         )
 
                 self.optimizer.step()
+                
+        end_time = time.time()
+        logging.info(f"[{self.client_id}] local_train execution time: {end_time - start_time:.4f} seconds")
 
     def prepare_update(self):
+        prep_start = time.time()
         update_bytes = weights_to_bytes(self.model, self.weight_dtype)
 
+        zkp_start = time.time()
         # Schnorr signature (identity proof)
         schnorr_proof = zkp_utils.generate_proof(
             self.sk,
@@ -130,8 +138,9 @@ class FederatedClient:
         sampled_weights = np.abs(flat[:10] * 1000).astype(int).tolist()
         
         snark_proof, snark_public, _ = zkp_utils.generate_snark(sampled_weights, threshold=100000000)
+        zkp_end = time.time()
 
-        return {
+        payload = {
             "client_id": self.client_id,
             "update_bytes": update_bytes,
             "zkp": schnorr_proof,
@@ -139,3 +148,13 @@ class FederatedClient:
             "snark_public": snark_public,
             "public_key": self.pk,
         }
+        
+        payload_size_kb = sys.getsizeof(payload) / 1024.0
+        
+        prep_end = time.time()
+        
+        logging.info(f"[{self.client_id}] prepare_update overall time: {prep_end - prep_start:.4f} seconds")
+        logging.info(f"[{self.client_id}] ZKP proof generation time: {zkp_end - zkp_start:.4f} seconds")
+        logging.info(f"[{self.client_id}] Outgoing payload size: {payload_size_kb:.2f} KB")
+
+        return payload

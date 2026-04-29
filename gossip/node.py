@@ -1,4 +1,5 @@
 import logging
+import time
 from torch.utils.data import DataLoader
 import numpy as np
 
@@ -129,6 +130,8 @@ class GossipNode:
         return total_norm <= max_norm
 
     def aggregate_local_updates(self, submissions: list[dict], template_model):
+        start_time = time.time()
+        
         if not submissions:
             logging.warning(f"[{self.client_id}] no submissions available for aggregation")
             return
@@ -179,4 +182,6 @@ class GossipNode:
 
         apply_weight_arrays(self.client.model, averaged)
 
+        end_time = time.time()
         logging.info(f"[{self.client_id}] validated FedAvg aggregation completed")
+        logging.info(f"[{self.client_id}] aggregate_local_updates overall execution time: {end_time - start_time:.4f} seconds")
