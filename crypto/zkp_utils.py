@@ -7,10 +7,25 @@ import subprocess
 import tempfile
 
 
-
-# Large prime group parameters
 P = 208351617316091241234326746312124448251235562226470491514186331217050270460481
 G = 2
+
+
+def _get_zkp_dir():
+    """
+    Works on both Windows and Colab/Linux.
+    crypto/zkp_utils.py -> project root -> zkp/
+    """
+    current_file_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_file_dir)
+    return os.path.join(project_root, "zkp")
+
+
+def _npx_cmd():
+    """
+    Windows uses npx.cmd, Linux/Colab uses npx.
+    """
+    return "npx.cmd" if os.name == "nt" else "npx"
 
 
 def _hash_to_int(*values) -> int:
@@ -80,68 +95,95 @@ def verify_proof(public_key: int, update_bytes: bytes, client_id: str, proof: di
 
     return left == right, verify_ms
 
+
 def generate_snark(values: list[int], threshold: int):
     start = time.time()
+
     input_data = {
         "values": values,
-        "threshold": threshold
+        "threshold": threshold,
     }
-    
-    # We use the existing directory to run snarkjs
-    zkp_dir = r"c:\Users\ADITHI\Desktop\fedavg_dp_zkp\zkp"
+
+    zkp_dir = _get_zkp_dir()
     build_dir = os.path.join(zkp_dir, "build")
-    
+
+    if not os.path.isdir(zkp_dir):
+        raise FileNotFoundError(f"ZKP directory not found: {zkp_dir}")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input.json")
-        with open(input_path, "w") as f:
-            json.dump(input_data, f)
-            
         proof_path = os.path.join(tmpdir, "proof.json")
         public_path = os.path.join(tmpdir, "public.json")
-        
+
+        with open(input_path, "w") as f:
+            json.dump(input_data, f)
+
         cmd = [
-            "npx.cmd", "snarkjs", "groth16", "fullprove",
+            _npx_cmd(),
+            "snarkjs",
+            "groth16",
+            "fullprove",
             input_path,
             os.path.join(build_dir, "update_norm_js", "update_norm.wasm"),
             os.path.join(build_dir, "update_norm_0001.zkey"),
             proof_path,
-            public_path
+            public_path,
         ]
-        
-        subprocess.run(cmd, check=True, cwd=zkp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
+        subprocess.run(
+            cmd,
+            check=True,
+            cwd=zkp_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
         with open(proof_path, "r") as f:
             proof = json.load(f)
+
         with open(public_path, "r") as f:
             public_signals = json.load(f)
-            
+
     snark_ms = (time.time() - start) * 1000
     return proof, public_signals, snark_ms
 
+
 def verify_snark(proof: dict, public_signals: list):
     start = time.time()
-    
-    zkp_dir = r"c:\Users\ADITHI\Desktop\fedavg_dp_zkp\zkp"
+
+    zkp_dir = _get_zkp_dir()
     build_dir = os.path.join(zkp_dir, "build")
-    
+
+    if not os.path.isdir(zkp_dir):
+        raise FileNotFoundError(f"ZKP directory not found: {zkp_dir}")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         proof_path = os.path.join(tmpdir, "proof.json")
         public_path = os.path.join(tmpdir, "public.json")
-        
+
         with open(proof_path, "w") as f:
             json.dump(proof, f)
+
         with open(public_path, "w") as f:
             json.dump(public_signals, f)
-            
+
         cmd = [
-            "npx.cmd", "snarkjs", "groth16", "verify",
+            _npx_cmd(),
+            "snarkjs",
+            "groth16",
+            "verify",
             os.path.join(build_dir, "verification_key.json"),
             public_path,
-            proof_path
+            proof_path,
         ]
-        
-        result = subprocess.run(cmd, capture_output=True, cwd=zkp_dir)
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            cwd=zkp_dir,
+        )
+
         is_valid = "OK" in result.stdout.decode()
-        
+
     verify_ms = (time.time() - start) * 1000
     return is_valid, verify_ms

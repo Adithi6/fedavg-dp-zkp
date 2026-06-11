@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 
-class SmallCNN(nn.Module):
+class LeNet(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -12,18 +12,20 @@ class SmallCNN(nn.Module):
         input_width: int,
         conv1_channels: int,
         conv2_channels: int,
-        hidden_dim: int,
     ):
         super().__init__()
 
+        # Using GroupNorm instead of BatchNorm because it's compatible with DP
         self.features = nn.Sequential(
-            nn.Conv2d(input_channels, conv1_channels, kernel_size=3, padding=1),
+            nn.Conv2d(input_channels, conv1_channels, kernel_size=5, stride=1, padding=2),
+            nn.GroupNorm(4, conv1_channels), # 4 groups
             nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(conv1_channels, conv2_channels, kernel_size=3, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(conv1_channels, conv2_channels, kernel_size=5, stride=1, padding=2),
+            nn.GroupNorm(4, conv2_channels), # 4 groups
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(kernel_size=2, stride=2)
         )
 
         flattened_dim = self._get_flattened_dim(
@@ -33,21 +35,16 @@ class SmallCNN(nn.Module):
         )
 
         self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flattened_dim, hidden_dim),
+            nn.Linear(flattened_dim, 120),
             nn.ReLU(),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(120, 84),
+            nn.ReLU(),
+            nn.Linear(84, num_classes)
         )
 
         logging.info(
-            "SmallCNN model initialized | "
-            f"input_channels={input_channels} "
-            f"input_size=({input_height}, {input_width}) "
-            f"conv1_channels={conv1_channels} "
-            f"conv2_channels={conv2_channels} "
-            f"hidden_dim={hidden_dim} "
-            f"num_classes={num_classes} "
-            f"flattened_dim={flattened_dim}"
+            "LeNet-5 with GroupNorm initialized | "
+            f"params={sum(p.numel() for p in self.parameters())}"
         )
 
     def _get_flattened_dim(
@@ -63,5 +60,6 @@ class SmallCNN(nn.Module):
 
     def forward(self, x):
         x = self.features(x)
+        x = x.view(x.size(0), -1)
         x = self.classifier(x)
         return x

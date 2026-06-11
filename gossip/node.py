@@ -13,8 +13,8 @@ class GossipNode:
     - FedAvg
     - Differential Privacy
     - Gossip communication
-    - Schnorr ZKP verification is handled in gossip/protocol.py
-    - Update validation is handled before aggregation
+    - ZKP verification handled in gossip/protocol.py
+    - Update validation handled before aggregation
     """
 
     def __init__(
@@ -31,8 +31,15 @@ class GossipNode:
         input_width: int,
         conv1_channels: int,
         conv2_channels: int,
-        hidden_dim: int,
+        dp_config: dict | None = None,
+        zkp_config: dict | None = None,
     ):
+        if dp_config is None:
+            dp_config = {}
+
+        if zkp_config is None:
+            zkp_config = {}
+
         self.client = FederatedClient(
             client_id=client_id,
             dataloader=dataloader,
@@ -46,7 +53,8 @@ class GossipNode:
             input_width=input_width,
             conv1_channels=conv1_channels,
             conv2_channels=conv2_channels,
-            hidden_dim=hidden_dim,
+            dp_config=dp_config,
+            zkp_config=zkp_config,
         )
 
         self.client_id = client_id
@@ -55,17 +63,29 @@ class GossipNode:
 
         logging.info(
             f"[{self.client_id}] gossip node initialized | "
-            f"weight_dtype={weight_dtype} learning_rate={learning_rate} "
-            f"model={model_name}"
+            f"weight_dtype={weight_dtype}, "
+            f"learning_rate={learning_rate}, "
+            f"model={model_name}, "
+            f"epsilon={dp_config.get('epsilon', 1.0)}, "
+            f"delta={dp_config.get('delta', 1e-5)}, "
+            f"clip_norm={dp_config.get('clip_norm', 0.5)}, "
+            f"zkp_enabled={zkp_config.get('enabled', True)}, "
+            f"proof_system={zkp_config.get('proof_system', 'circom_snark')}"
         )
 
+    def _raw_model(self):
+        if hasattr(self.client, "get_raw_model"):
+            return self.client.get_raw_model()
+
+        if hasattr(self.client.model, "_module"):
+            return self.client.model._module
+
+        return self.client.model
+
     def local_train(self, global_weight_arrays: list | None, epochs: int = 1):
-        self.client.local_train(global_weight_arrays, epochs)
+        return self.client.local_train(global_weight_arrays, epochs)
 
     def prepare_update(self) -> dict:
-        """
-        Creates a model update with Schnorr ZKP proof.
-        """
         self.own_submission = self.client.prepare_update()
         self.inbox.clear()
 
@@ -109,16 +129,6 @@ class GossipNode:
         logging.info(f"[{self.client_id}] cleared round submissions")
 
     def is_valid_update(self, arrays: list, max_norm: float = 100.0) -> bool:
-        """
-        Lightweight abnormal-update validation.
-        Rejects:
-        - NaN values
-        - Infinite values
-        - Extremely large model updates
-
-        This does not replace full zk-SNARK training correctness proof,
-        but helps reject abnormal/malicious updates.
-        """
         total_norm = 0.0
 
         for arr in arrays:
@@ -129,32 +139,47 @@ class GossipNode:
 
         return total_norm <= max_norm
 
-    def aggregate_local_updates(self, submissions: list[dict], template_model):
+    def aggregate_local_updates(self, submissions: list[dict], template_model=None):
         start_time = time.time()
-        
+
         if not submissions:
-            logging.warning(f"[{self.client_id}] no submissions available for aggregation")
+            logging.warning(
+                f"[{self.client_id}] no submissions available for aggregation"
+            )
             return
 
-        logging.info(f"[{self.client_id}] received {len(submissions)} submission(s) for aggregation")
+        logging.info(
+            f"[{self.client_id}] received {len(submissions)} submission(s) "
+            f"for aggregation"
+        )
 
         dtype_name = self.client.weight_dtype
+        model_for_template = self._raw_model()
 
         weight_sets = []
         accepted_clients = []
         rejected_clients = []
 
         for sub in submissions:
-            arrays = bytes_to_weight_arrays(
-                sub["update_bytes"],
-                template_model,
-                dtype_name=dtype_name,
-            )
+            try:
+                arrays = bytes_to_weight_arrays(
+                    sub["update_bytes"],
+                    model_for_template,
+                    dtype_name=dtype_name,
+                )
+            except Exception as e:
+                rejected_clients.append(sub.get("client_id", "unknown"))
+                logging.warning(
+                    f"[{self.client_id}] failed to decode update from "
+                    f"{sub.get('client_id', 'unknown')} | error={e}"
+                )
+                continue
 
             if not self.is_valid_update(arrays):
                 rejected_clients.append(sub["client_id"])
                 logging.warning(
-                    f"[{self.client_id}] rejected abnormal update from {sub['client_id']}"
+                    f"[{self.client_id}] rejected abnormal update from "
+                    f"{sub['client_id']}"
                 )
                 continue
 
@@ -167,21 +192,24 @@ class GossipNode:
 
         logging.info(
             f"[{self.client_id}] valid updates accepted: "
-            f"{len(accepted_clients)}/{len(submissions)} | clients={accepted_clients}"
+            f"{len(accepted_clients)}/{len(submissions)} | "
+            f"clients={accepted_clients}"
         )
 
         if rejected_clients:
-            logging.warning(
-                f"[{self.client_id}] rejected clients: {rejected_clients}"
-            )
+            logging.warning(f"[{self.client_id}] rejected clients: {rejected_clients}")
 
         averaged = [
             np.mean([weights[i] for weights in weight_sets], axis=0)
             for i in range(len(weight_sets[0]))
         ]
 
-        apply_weight_arrays(self.client.model, averaged)
+        apply_weight_arrays(self._raw_model(), averaged)
 
         end_time = time.time()
+
         logging.info(f"[{self.client_id}] validated FedAvg aggregation completed")
-        logging.info(f"[{self.client_id}] aggregate_local_updates overall execution time: {end_time - start_time:.4f} seconds")
+        logging.info(
+            f"[{self.client_id}] aggregate_local_updates overall execution time: "
+            f"{end_time - start_time:.4f} seconds"
+        )

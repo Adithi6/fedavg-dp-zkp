@@ -58,13 +58,17 @@ def evaluate_model(model, test_loader, device):
     model.eval()
     correct = 0
     total = 0
+
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
+
             outputs = model(data)
             _, predicted = torch.max(outputs.data, 1)
+
             total += target.size(0)
             correct += (predicted == target).sum().item()
+
     return correct / total
 
 
@@ -88,9 +92,23 @@ def main():
     DATA = config["data"]
     WEIGHTS = config["weights"]
 
-    logging.info("Model 3 enabled: FedAvg + DP + Gossip + Circom zk-SNARK validation")
-    logging.info("Dilithium disabled")
-    logging.info("ZKP purpose: verify update-bound constraint before aggregation")
+    DP_CONFIG = config.get("dp", {})
+    ZKP_CONFIG = config.get("zkp", {})
+
+    logging.info(
+        "DP settings loaded from config | "
+        f"enabled={DP_CONFIG.get('enabled', True)} | "
+        f"epsilon={DP_CONFIG.get('epsilon', 1.0)} | "
+        f"delta={DP_CONFIG.get('delta', 1e-5)} | "
+        f"clip_norm={DP_CONFIG.get('clip_norm', 0.5)} | "
+        f"auto_noise={DP_CONFIG.get('auto_noise', True)} | "
+        f"base_noise={DP_CONFIG.get('base_noise', 0.05)}"
+    )
+
+    logging.info(
+        "Model 3 enabled: FedAvg + Differential Privacy + Gossip + zk-SNARK validation"
+    )
+    logging.info("Update validation performed using Circom zk-SNARK proofs")
 
     client_loaders, test_loader = make_client_loaders(
         n_clients=N_CLIENTS,
@@ -107,6 +125,7 @@ def main():
     )
 
     nodes = []
+
     for i in range(N_CLIENTS):
         node = GossipNode(
             client_id=f"client_{i}",
@@ -121,8 +140,10 @@ def main():
             input_width=MODEL["input_width"],
             conv1_channels=MODEL["conv1_channels"],
             conv2_channels=MODEL["conv2_channels"],
-            hidden_dim=MODEL["hidden_dim"],
+            dp_config=DP_CONFIG,
+            zkp_config=ZKP_CONFIG,
         )
+
         nodes.append(node)
 
     gossip = GossipProtocol(
@@ -148,22 +169,17 @@ def main():
 
         clear_round_state(nodes, gossip)
 
-        # 1. Local DP training
         for node in nodes:
             node.local_train(None, epochs=LOCAL_EPOCHS)
 
-        # 2. Prepare update + zk-SNARK proof
         for node in nodes:
             node.prepare_update()
 
-        # 3. Gossip propagation with ZKP verification
         gossip.run_round(nodes)
 
-        # 4. Select aggregator based on maximum valid received updates
         aggregator = choose_aggregator_node(nodes)
         subs = aggregator.get_all_submissions()
 
-        # 5. Validated FedAvg aggregation
         if len(subs) == N_CLIENTS:
             logging.info(
                 f"[{aggregator.client_id}] aggregating complete round "
@@ -182,10 +198,13 @@ def main():
             sync_weights_to_all_nodes(nodes, updated_weights)
 
             accuracy = evaluate_model(aggregator.client.model, test_loader, device)
+
             logging.info(f"Round {r} global test accuracy: {accuracy * 100:.2f}%")
             logging.info(f"Round {r} validated aggregated model synced to all nodes")
         else:
-            logging.warning(f"Round {r} skipped because no valid submissions were available")
+            logging.warning(
+                f"Round {r} skipped because no valid submissions were available"
+            )
 
         clear_round_state(nodes, gossip)
 
